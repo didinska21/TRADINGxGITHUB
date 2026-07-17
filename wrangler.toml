@@ -7,7 +7,7 @@ compatibility_date = "2024-11-01"
 # Lalu isi "id" di bawah ini dengan id yang muncul dari command tersebut.
 [[kv_namespaces]]
 binding = "BOT_KV"
-id = "ISI_DENGAN_ID_DARI_WRANGLER_KV_NAMESPACE_CREATE"
+id = "3192830733b44378805c83ea1abde9d4"
 
 # Secrets (JANGAN ditulis di sini — set lewat wrangler secret put, lihat README-cloudflare.md):
 # TELEGRAM_BOT_TOKEN
