@@ -1,0 +1,16 @@
+name = "futures-trading-bot"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# KV Namespace untuk menyimpan session per-user (exchange, mode, pair, modal, state).
+# Bikin dulu dengan: wrangler kv namespace create BOT_KV
+# Lalu isi "id" di bawah ini dengan id yang muncul dari command tersebut.
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "ISI_DENGAN_ID_DARI_WRANGLER_KV_NAMESPACE_CREATE"
+
+# Secrets (JANGAN ditulis di sini — set lewat wrangler secret put, lihat README-cloudflare.md):
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_WEBHOOK_SECRET
+# GROQ_API_KEY_1 ... GROQ_API_KEY_10
+# ALLOWED_USER_IDS   (opsional, contoh: "123456789,987654321")
