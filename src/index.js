@@ -160,7 +160,19 @@ function pairsKb(pairList, page = 0, per = 9) {
 // ══════════════════════════════════════════════════════════
 async function binanceTopPairs(limit = 20) {
   const res = await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr");
-  const data = await res.json();
+  const raw = await res.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    // Bukan JSON valid — tampilkan status + potongan response asli biar ketauan penyebabnya
+    throw new Error(
+      `Binance response bukan JSON (HTTP ${res.status}). Cuplikan: ${raw.slice(0, 200)}`
+    );
+  }
+  if (!Array.isArray(data)) {
+    throw new Error(`Binance response bukan array. Isi: ${JSON.stringify(data).slice(0, 200)}`);
+  }
   return data
     .filter((p) => p.symbol.endsWith("USDT"))
     .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
