@@ -15,8 +15,14 @@
  * PENTING: LLM tidak punya akses internet bawaan dan pengetahuannya berhenti di
  * training cutoff — makanya SEMUA jadwal & analisa di sini WAJIB disuntik data
  * hasil pencarian web dulu (lewat Serper.dev), bukan ditanya langsung ke AI.
- * Kalau di-skip, AI akan "mengarang" tanggal/harga dari ingatan lama (pernah
- * kejadian di versi sebelumnya — AI nyebut tahun 2021 padahal sekarang 2026).
+ * Kalau di-skip, AI akan "mengarang" tanggal/harga dari ingatan lama.
+ *
+ * v2.1 — Jadwal News sekarang pakai BEBERAPA query pencarian spesifik
+ * (FOMC, CPI, NFP, ECB, kripto) secara paralel, bukan 1 query generik.
+ * Query generik sering nyangkut ke halaman kalender yang cuplikannya
+ * gak nyebut tanggal presisi, bikin AI (yang sengaja di-instruksiin gak boleh
+ * ngarang tanggal) selalu ngasih list kosong. Hasil kosong juga TIDAK di-cache
+ * lagi, biar sekali gagal gak macet 6 jam.
  *
  * State per-user disimpan di Cloudflare KV (BOT_KV). Jadwal event di-cache
  * global (bukan per-user) selama 6 jam supaya hemat kuota search.
@@ -209,17 +215,31 @@ async function callGroqIndexed(env, idx, messages, maxTokens = 1200, temperature
 // ══════════════════════════════════════════════════════════
 const MONTH_NAMES = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
 
-const SCHEDULE_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar jadwal event ekonomi/market dari hasil pencarian web mentah yang diberikan user.
+const SCHEDULE_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar jadwal event ekonomi & kripto dari hasil pencarian web mentah yang diberikan user.
 ATURAN KETAT:
 - Balas HANYA dengan JSON array valid. TIDAK ADA teks lain, TIDAK ADA markdown code fence (\`\`\`).
-- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat"}
+- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat","category":"macro" atau "crypto"}
 - "time_wib" WAJIB format 24 jam (00:00–23:59), dikonversi ke WIB (UTC+7).
-  Kalau sumber menyebut jam dalam zona lain (GMT/UTC, ET, EST/EDT), konversi ke WIB.
+  Kalau sumber menyebut jam dalam zona lain (ET/EST/EDT = UTC-4/-5, CET/CEST = UTC+1/+2, GMT/UTC),
+  konversi ke WIB dengan hati-hati (perhatikan apakah sedang daylight saving).
   Kalau sumber TIDAK menyebutkan jam sama sekali, isi "time_wib" dengan "-" — JANGAN mengarang jam.
-- Ambil maksimal 12 event yang paling relevan untuk trader forex/crypto (contoh: NFP, CPI, FOMC, keputusan suku bunga, PPI, GDP).
-- Urutkan dari tanggal & jam paling dekat ke yang paling jauh.
+- Prioritaskan data dari sumber resmi (bls.gov, federalreserve.gov, ecb.europa.eu, situs berita finansial/kripto ternama).
+  Kalau ada 2 sumber beda untuk event yang sama, pakai yang dari domain resmi/institusi.
 - KALAU data mentah tidak menyebutkan tanggal yang jelas untuk suatu event, JANGAN masukkan event itu. Jangan mengarang tanggal.
+- Gabungkan event macro (NFP, CPI, PPI, FOMC, ECB) dan event kripto (regulasi, ETF, upgrade jaringan, listing besar) dalam satu list, tandai categorynya.
+- Ambil maksimal 12 event yang paling relevan.
+- Urutkan dari tanggal & jam paling dekat ke yang paling jauh.
 - Kalau data mentah sama sekali tidak cukup, balas array kosong: []`;
+
+function extractItems(result, type) {
+  const list = type === "news" ? (result?.news || []) : (result?.organic || []);
+  return list.map((o) => ({
+    title: o.title,
+    snippet: o.snippet || "",
+    date: o.date || null,
+    source: o.link || o.source || "?",
+  }));
+}
 
 async function buildScheduleList(env, forceRefresh = false) {
   if (!forceRefresh) {
@@ -227,7 +247,7 @@ async function buildScheduleList(env, forceRefresh = false) {
     if (cacheRaw) {
       try {
         const cached = JSON.parse(cacheRaw);
-        if (Array.isArray(cached.list)) return cached.list;
+        if (Array.isArray(cached.list) && cached.list.length > 0) return cached.list;
       } catch (e) {
         /* cache korup, lanjut rebuild */
       }
@@ -236,16 +256,41 @@ async function buildScheduleList(env, forceRefresh = false) {
 
   const now = new Date();
   const monthYear = `${MONTH_NAMES[now.getUTCMonth()]} ${now.getUTCFullYear()}`;
-  const searchData = await serperSearch(env, `kalender ekonomi jadwal event forex ${monthYear}`, "search", 10);
-  const rawItems = (searchData.organic || [])
-    .map((o) => `- ${o.title}: ${o.snippet || ""} (${o.date || "tanggal tidak disebutkan"})`)
-    .join("\n");
+  const year = now.getUTCFullYear();
 
-  const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)} (format YYYY-MM-DD).\n\nHasil pencarian mentah:\n${rawItems || "(kosong)"}`;
+  // Beberapa query SPESIFIK dijalankan paralel, bukan 1 query generik.
+  // Query generik ("kalender ekonomi Juli 2026") sering nyangkut ke halaman
+  // kalender yang cuplikannya gak nyebut tanggal presisi - bikin AI (yang
+  // sengaja dilarang ngarang tanggal) selalu ngasih list kosong.
+  const queries = [
+    { q: `FOMC meeting schedule interest rate decision ${year}`, type: "search" },
+    { q: `CPI inflation release date ${monthYear}`, type: "search" },
+    { q: `nonfarm payrolls NFP release date ${monthYear}`, type: "search" },
+    { q: `ECB rate decision ${monthYear}`, type: "search" },
+    { q: `crypto regulation ETF news ${monthYear}`, type: "news" },
+    { q: `jadwal event kripto ${monthYear} SEC bitcoin ethereum`, type: "news" },
+  ];
+
+  const results = await Promise.all(
+    queries.map((qq) => serperSearch(env, qq.q, qq.type, 6).catch(() => null))
+  );
+
+  const rawLines = [];
+  results.forEach((r, i) => {
+    if (!r) return;
+    const items = extractItems(r, queries[i].type);
+    items.forEach((o) => {
+      rawLines.push(`- [query: ${queries[i].q}] ${o.title}: ${o.snippet} (${o.date || "tanggal tidak disebutkan"}) [sumber: ${o.source}]`);
+    });
+  });
+
+  const rawItems = rawLines.join("\n");
+  const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)} (format YYYY-MM-DD).\n\nHasil pencarian mentah dari beberapa query:\n${rawItems || "(kosong)"}`;
+
   const raw = await callGroqIndexed(
     env, 0,
     [{ role: "system", content: SCHEDULE_SYSTEM_PROMPT }, { role: "user", content: userMsg }],
-    1200, 0.2
+    2000, 0.2
   );
 
   let list;
@@ -257,7 +302,10 @@ async function buildScheduleList(env, forceRefresh = false) {
     throw new Error(`Gagal menyusun jadwal dari hasil AI: ${e.message}. Potongan respons AI: ${raw.slice(0, 200)}`);
   }
 
-  await env.BOT_KV.put(SCHEDULE_CACHE_KEY, JSON.stringify({ list, ts: Date.now() }), { expirationTtl: SCHEDULE_CACHE_TTL });
+  // Jangan cache hasil kosong - biar sekali gagal gak macet 6 jam ke depan.
+  if (list.length > 0) {
+    await env.BOT_KV.put(SCHEDULE_CACHE_KEY, JSON.stringify({ list, ts: Date.now() }), { expirationTtl: SCHEDULE_CACHE_TTL });
+  }
   return list;
 }
 
@@ -266,7 +314,8 @@ function scheduleText(list) {
   const lines = ["📅 *JADWAL NEWS TERDEKAT* (waktu WIB)\n"];
   list.forEach((it, i) => {
     const jam = it.time_wib && it.time_wib !== "-" ? `${it.time_wib} WIB` : "jam belum diketahui";
-    lines.push(`${i + 1}. *${it.date}, ${jam}* — ${it.event}`);
+    const tag = it.category === "crypto" ? "🪙" : "🏛️";
+    lines.push(`${i + 1}. ${tag} *${it.date}, ${jam}* — ${it.event}`);
   });
   lines.push("\n_Data disusun otomatis dari hasil pencarian web, cek ulang di sumber resmi untuk kepastian jam & revisi._");
   return lines.join("\n");
@@ -395,7 +444,7 @@ async function handleMessage(message, env) {
     await sendMessage(
       env, chatId,
       `📰 *NEWS & ECONOMIC CALENDAR ANALYST BOT*\n\nHalo *${message.from.first_name}*!\n\n` +
-      `Bot ini bantu kamu pantau jadwal event ekonomi penting dan analisa dampaknya ke market pakai konsensus beberapa AI.\n\n` +
+      `Bot ini bantu kamu pantau jadwal event ekonomi & kripto penting dan analisa dampaknya ke market pakai konsensus beberapa AI.\n\n` +
       `⚠️ Hanya alat bantu analisis, bukan nasihat finansial. Selalu cek ulang ke sumber resmi.\n\nPilih menu di bawah:`,
       { reply_markup: mainKb() }
     );
@@ -405,7 +454,7 @@ async function handleMessage(message, env) {
   if (txt === "/help" || txt === "❓ Bantuan") {
     await sendMessage(env, chatId,
       "❓ *BANTUAN*\n\n" +
-      "📅 *Jadwal News* → lihat daftar event ekonomi terdekat (NFP, CPI, FOMC, dll), diambil otomatis dari hasil pencarian web.\n\n" +
+      "📅 *Jadwal News* → lihat daftar event ekonomi & kripto terdekat (NFP, CPI, FOMC, ECB, regulasi kripto, dll), diambil otomatis dari hasil pencarian web.\n\n" +
       "📰 *Analisa News* → sama seperti Jadwal News, tapi tiap event bisa di-tap. Pilih 5 atau 10 AI, bot akan cari berita terkait event itu dan menyimpulkan sentimen/dampaknya ke market.\n\n" +
       "Data jadwal di-cache 6 jam. Tap '🔄 Refresh Jadwal' kalau mau paksa update."
     );
