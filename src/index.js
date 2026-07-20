@@ -219,9 +219,12 @@ const MONTH_NAMES = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Ju
 const SCHEDULE_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar jadwal event ekonomi/market dari hasil pencarian web mentah yang diberikan user.
 ATURAN KETAT:
 - Balas HANYA dengan JSON array valid. TIDAK ADA teks lain, TIDAK ADA markdown code fence (\`\`\`).
-- Format tiap item persis: {"date":"DD Bulan","event":"Nama event singkat"}
+- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat"}
+- "time_wib" WAJIB format 24 jam (00:00–23:59), dikonversi ke WIB (UTC+7).
+  Kalau sumber menyebut jam dalam zona lain (GMT/UTC, ET, EST/EDT), konversi ke WIB.
+  Kalau sumber TIDAK menyebutkan jam sama sekali, isi "time_wib" dengan "-" — JANGAN mengarang jam.
 - Ambil maksimal 12 event yang paling relevan untuk trader forex/crypto (contoh: NFP, CPI, FOMC, keputusan suku bunga, PPI, GDP).
-- Urutkan dari tanggal paling dekat ke yang paling jauh.
+- Urutkan dari tanggal & jam paling dekat ke yang paling jauh.
 - KALAU data mentah tidak menyebutkan tanggal yang jelas untuk suatu event, JANGAN masukkan event itu. Jangan mengarang tanggal.
 - Kalau data mentah sama sekali tidak cukup, balas array kosong: []`;
 
@@ -267,10 +270,22 @@ async function buildScheduleList(env, forceRefresh = false) {
 
 function scheduleText(list) {
   if (!list.length) return "📭 Belum ada jadwal event yang berhasil ditemukan. Coba lagi beberapa saat lagi.";
-  const lines = ["📅 *JADWAL NEWS TERDEKAT*\n"];
-  list.forEach((it, i) => lines.push(`${i + 1}. *${it.date}* — ${it.event}`));
+  const lines = ["📅 *JADWAL NEWS TERDEKAT* (waktu WIB)\n"];
+  list.forEach((it, i) => {
+    const jam = it.time_wib && it.time_wib !== "-" ? `${it.time_wib} WIB` : "jam belum diketahui";
+    lines.push(`${i + 1}. *${it.date}, ${jam}* — ${it.event}`);
+  });
   lines.push("\n_Data disusun otomatis dari hasil pencarian web, cek ulang di sumber resmi untuk kepastian jam & revisi._");
   return lines.join("\n");
+}
+
+function scheduleKb(list) {
+  const rows = list.map((it, i) => {
+    const jam = it.time_wib && it.time_wib !== "-" ? ` ${it.time_wib}` : "";
+    return [{ text: `${it.date}${jam} — ${it.event}`.slice(0, 60), callback_data: `ev_${i}` }];
+  });
+  rows.push([{ text: "🔄 Refresh Jadwal", callback_data: "refresh_schedule" }]);
+  return { inline_keyboard: rows };
 }
 
 // ══════════════════════════════════════════════════════════
@@ -456,7 +471,8 @@ async function handleCallback(cb, env) {
       await sendMessage(env, chatId, "⚠️ Jadwal ini sudah kadaluarsa, buka lagi '📰 Analisa News'.");
       return;
     }
-    await sendMessage(env, chatId, `📌 *${event.date} — ${event.event}*\n\nMau dianalisa pakai berapa AI?`, { reply_markup: aiCountKb(idx) });
+    const jam = event.time_wib && event.time_wib !== "-" ? `, ${event.time_wib} WIB` : "";
+    await sendMessage(env, chatId, `📌 *${event.date}${jam} — ${event.event}*\n\nMau dianalisa pakai berapa AI?`, { reply_markup: aiCountKb(idx) });
     return;
   }
 
