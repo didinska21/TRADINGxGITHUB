@@ -129,14 +129,6 @@ function mainKb() {
   };
 }
 
-function scheduleKb(list) {
-  const rows = list.map((it, i) => [
-    { text: `${it.date} — ${it.event}`.slice(0, 60), callback_data: `ev_${i}` },
-  ]);
-  rows.push([{ text: "🔄 Refresh Jadwal", callback_data: "refresh_schedule" }]);
-  return { inline_keyboard: rows };
-}
-
 function aiCountKb(idx) {
   return {
     inline_keyboard: [
