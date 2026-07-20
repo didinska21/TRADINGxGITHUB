@@ -139,6 +139,7 @@ function aiCountKb(idx) {
     ],
   };
 }
+// Catatan: "N AI" = N total panggilan AI (N-1 analis independen + 1 yang menyimpulkan).
 
 // ══════════════════════════════════════════════════════════
 //  SERPER.DEV — WEB & NEWS SEARCH
@@ -314,15 +315,25 @@ bukan ${n} model berbeda — anggap sebagai pengecekan konsistensi, bukan valida
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 }
 
-async function analyzeEvent(env, event, n) {
-  const searchData = await serperSearch(env, `${event.event} ${event.date} berita analisis dampak`, "news", 10);
-  const newsItems = searchData.news || searchData.organic || [];
+async function analyzeEvent(env, event, nTotal) {
+  const nOpinions = Math.max(1, nTotal - 1); // sisakan 1 slot untuk panggilan kesimpulan akhir
+
+  // Query dibikin longgar (tanpa tanggal presisi) supaya search engine tidak "nyasar"
+  // gara-gara tanggal spesifik jarang cocok persis dengan judul artikel.
+  let newsData = await serperSearch(env, `${event.event} dampak market analisis`, "news", 10);
+  let newsItems = newsData.news || [];
+  if (!newsItems.length) {
+    // Fallback: coba web search biasa kalau search "news" kosong
+    const webData = await serperSearch(env, `${event.event} berita terbaru analisis market`, "search", 10);
+    newsItems = webData.organic || [];
+  }
+
   const items = newsItems
-    .slice(0, 8)
+    .slice(0, 10)
     .map((o) => `- [${o.date || "?"}] ${o.title}: ${o.snippet || ""} (sumber: ${o.source || o.link || "?"})`)
     .join("\n");
 
-  if (!items) throw new Error("Tidak menemukan cuplikan berita terkait event ini.");
+  if (!items) throw new Error("Tidak menemukan cuplikan berita terkait event ini, coba lagi nanti atau pilih event lain.");
 
   const basePrompt = `EVENT: ${event.event} (${event.date})\n\nCUPLIKAN BERITA TERKAIT (hasil pencarian):\n${items}\n\nAnalisa dampak event ini ke market berdasarkan cuplikan di atas.`;
 
@@ -339,17 +350,17 @@ async function analyzeEvent(env, event, n) {
     }
   };
 
-  const opinions = await Promise.all(Array.from({ length: n }, (_, i) => oneOpinion(i)));
+  const opinions = await Promise.all(Array.from({ length: nOpinions }, (_, i) => oneOpinion(i)));
 
-  let consensusInput = `Berikut ${n} analisis independen untuk event yang sama:\n\n`;
+  let consensusInput = `Berikut ${nOpinions} analisis independen untuk event yang sama:\n\n`;
   opinions.forEach((op, i) => {
     consensusInput += `=== ANALIS #${i + 1} ===\n${op}\n\n`;
   });
   consensusInput += `Event: ${event.event} (${event.date})\nSimpulkan sesuai instruksi sistem.`;
 
   const final = await callGroqIndexed(
-    env, n,
-    [{ role: "system", content: newsConsensusPrompt(n) }, { role: "user", content: consensusInput }],
+    env, nOpinions,
+    [{ role: "system", content: newsConsensusPrompt(nOpinions) }, { role: "user", content: consensusInput }],
     1200, 0.3
   );
   return { final, opinions };
@@ -477,7 +488,7 @@ async function handleCallback(cb, env) {
       await sendMessage(env, chatId, "⚠️ Jadwal ini sudah kadaluarsa, buka lagi '📰 Analisa News'.");
       return;
     }
-    await sendMessage(env, chatId, `⏳ Menjalankan ${n} AI + 1 kesimpulan untuk *${event.event}*... (~10-20 detik)`);
+    await sendMessage(env, chatId, `⏳ Menjalankan ${n} AI (${n - 1} analis + 1 kesimpulan) untuk *${event.event}*... (~10-20 detik)`);
     try {
       const { final, opinions } = await analyzeEvent(env, event, n);
       s.last_opinions = opinions;
