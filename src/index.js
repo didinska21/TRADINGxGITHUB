@@ -179,13 +179,29 @@ async function binanceTopPairs(limit = 20) {
     .slice(0, limit);
 }
 
+async function fetchJsonLogged(url, label) {
+  try {
+    const res = await fetch(url);
+    const raw = await res.text();
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error(`[binance:${label}] HTTP ${res.status} bukan JSON. Cuplikan: ${raw.slice(0, 200)}`);
+      return null;
+    }
+  } catch (e) {
+    console.error(`[binance:${label}] fetch gagal total: ${e.message}`);
+    return null;
+  }
+}
+
 async function binanceMarket(symbol, tf1, tf2) {
   const [tick, ob, fund, kl1, kl2] = await Promise.all([
-    fetch(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`).then((r) => r.json()).catch(() => null),
-    fetch(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=5`).then((r) => r.json()).catch(() => null),
-    fetch(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`).then((r) => r.json()).catch(() => null),
-    fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf1}&limit=100`).then((r) => r.json()).catch(() => null),
-    fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf2}&limit=60`).then((r) => r.json()).catch(() => null),
+    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`, "ticker"),
+    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=5`, "depth"),
+    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`, "premiumIndex"),
+    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf1}&limit=100`, "klines1"),
+    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf2}&limit=60`, "klines2"),
   ]);
 
   const parseKl = (raw) => {
