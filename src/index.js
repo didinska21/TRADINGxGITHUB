@@ -159,7 +159,7 @@ function pairsKb(pairList, page = 0, per = 9) {
 //   dan TOP_PAIRS_FN di bawah, plus tambah tombol di exchangeKb().)
 // ══════════════════════════════════════════════════════════
 async function binanceTopPairs(limit = 20) {
-  const res = await fetch("https://fapi.binance.com/fapi/v1/ticker/24hr");
+  const res = await fetch("https://data-api.binance.vision/api/v3/ticker/24hr");
   const raw = await res.text();
   let data;
   try {
@@ -195,13 +195,17 @@ async function fetchJsonLogged(url, label) {
   }
 }
 
+// CATATAN: data-api.binance.vision adalah domain resmi Binance untuk data SPOT
+// yang tidak kena blokir region/cloud-IP seperti fapi.binance.com (futures).
+// Konsekuensinya: tidak ada funding rate (itu konsep khusus futures), dan
+// harga/volume yang didapat adalah harga SPOT, bukan futures (biasanya sangat
+// mirip tapi bisa sedikit beda karena basis/premium futures).
 async function binanceMarket(symbol, tf1, tf2) {
-  const [tick, ob, fund, kl1, kl2] = await Promise.all([
-    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`, "ticker"),
-    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=5`, "depth"),
-    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol}`, "premiumIndex"),
-    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf1}&limit=100`, "klines1"),
-    fetchJsonLogged(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${tf2}&limit=60`, "klines2"),
+  const [tick, ob, kl1, kl2] = await Promise.all([
+    fetchJsonLogged(`https://data-api.binance.vision/api/v3/ticker/24hr?symbol=${symbol}`, "ticker"),
+    fetchJsonLogged(`https://data-api.binance.vision/api/v3/depth?symbol=${symbol}&limit=5`, "depth"),
+    fetchJsonLogged(`https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${tf1}&limit=100`, "klines1"),
+    fetchJsonLogged(`https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${tf2}&limit=60`, "klines2"),
   ]);
 
   const parseKl = (raw) => {
@@ -221,7 +225,9 @@ async function binanceMarket(symbol, tf1, tf2) {
   const asks = ob?.asks || [];
   const bidVol = bids.slice(0, 5).reduce((s, b) => s + parseFloat(b[1]), 0);
   const askVol = asks.slice(0, 5).reduce((s, a) => s + parseFloat(a[1]), 0);
-  const funding = fund ? parseFloat(fund.lastFundingRate) * 100 : 0;
+  // Funding rate tidak tersedia di data spot — set null, bukan 0, biar
+  // prompt/AI tahu ini "tidak berlaku" (bukan funding rate 0%).
+  const funding = null;
 
   return { price, change, vol24, bidVol, askVol, funding, kl1: parseKl(kl1), kl2: parseKl(kl2), tf1, tf2 };
 }
@@ -300,7 +306,7 @@ async function collect(exchange, symbol, mode) {
     `Harga Terkini : $${d.price}`,
     `Perubahan 24H : ${d.change >= 0 ? "+" : ""}${d.change.toFixed(2)}%`,
     `Volume 24H    : $${d.vol24.toFixed(2)}M`,
-    `Funding Rate  : ${d.funding.toFixed(4)}% (${d.funding > 0 ? "Longs bayar Shorts" : "Shorts bayar Longs"})`,
+    `Funding Rate  : ${d.funding === null ? "N/A (data spot, bukan futures)" : d.funding.toFixed(4) + "% (" + (d.funding > 0 ? "Longs bayar Shorts" : "Shorts bayar Longs") + ")"}`,
     `Order Book    : Bid ${d.bidVol.toFixed(2)} vs Ask ${d.askVol.toFixed(2)} → ${d.bidVol > d.askVol ? "BELI DOMINAN 🟢" : "JUAL DOMINAN 🔴"}\n`,
   ];
 
