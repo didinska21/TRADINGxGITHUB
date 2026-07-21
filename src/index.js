@@ -1,30 +1,28 @@
 /**
  * 📰 News & Economic Calendar Analyst Bot — Cloudflare Workers edition
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * v2.2 — Perubahan dari v2.1:
- * 1. FOMC & ECB sekarang HARDCODE dari kalender resmi (federalreserve.gov,
- *    ecb.europa.eu) - bukan hasil search lagi. Ini event yang jadwalnya udah
- *    diumumin resmi jauh-jauh hari, jadi gak ada alasan nembak API buat ini.
- * 2. NFP dihitung otomatis (selalu Jumat pertama tiap bulan, 8:30 AM ET).
- * 3. CPI/PPI & event kripto TETAP pakai search (emang gak bisa dipastikan
- *    tanpa berita terkini) - tapi sekarang Groq CUMA diminta cari tanggalnya,
- *    jam rilisnya (8:30 AM ET, konvensi BLS) dihitung kode secara deterministik.
- * 4. Konversi timezone ET/CET → WIB sekarang dihitung kode (ngerti DST
- *    otomatis), bukan dipercayakan ke perhitungan manual Groq lagi.
+ * v2.3 — Perubahan dari v2.2:
+ * 1. FOMC/ECB/CPI/PPI/NFP sekarang di-SCRAPE langsung dari halaman kalender
+ *    resmi (federalreserve.gov, ecb.europa.eu, bls.gov) pakai Serper Scrape
+ *    API - bukan hardcode tabel manual (rawan basi) atau search snippet
+ *    (rawan kepotong). Groq baca ISI ASLI halaman, tugasnya cuma ekstraksi,
+ *    bukan ngarang. Update sendiri tiap kali dipanggil, gak perlu maintenance.
+ * 2. Waktu rilis (jam) TETAP dihitung kode secara deterministik (ngerti DST
+ *    otomatis) - AI cuma ambil tanggal + jam-kalau-ada dari halaman, bukan
+ *    disuruh hitung konversi timezone sendiri.
+ * 3. Event kripto (regulasi/ETF/listing) tetap dari search+news biasa karena
+ *    emang gak ada "kalender resmi" tunggal buat itu.
+ * 4. Bug fix: event kripto dulu selalu nongol di atas gara-gara _sort gak
+ *    pernah diisi tanggal asli - sekarang di-parse jadi timestamp beneran.
  * 5. Kalau semua API key Groq kena rate limit, bot kasih pesan jelas
  *    ("coba lagi besok") bukan error mentah.
  *
- * PENTING: LLM tidak punya akses internet bawaan - makanya event yang TIDAK
- * bisa dihardcode (CPI/PPI persis, berita kripto) WAJIB disuntik data hasil
- * pencarian web dulu (Serper.dev), bukan ditanya langsung ke AI.
- *
- * State per-user disimpan di Cloudflare KV (BOT_KV). Jadwal kripto/CPI/PPI
- * di-cache global selama 6 jam. Jadwal FOMC/ECB/NFP gak perlu cache (murah,
- * dihitung on-the-fly tiap request).
+ * State per-user disimpan di Cloudflare KV (BOT_KV). Jadwal (macro + kripto)
+ * di-cache global 6 jam supaya hemat kuota scrape/search.
  */
 
 const MODEL = "llama-3.3-70b-versatile";
-const SCHEDULE_CACHE_KEY = "news_schedule_cache_v2"; // versi baru, cache lama otomatis basi
+const SCHEDULE_CACHE_KEY = "news_schedule_cache_v3";
 const SCHEDULE_CACHE_TTL = 6 * 60 * 60; // 6 jam
 
 // ══════════════════════════════════════════════════════════
@@ -144,10 +142,8 @@ function aiCountKb(idx) {
 
 // ══════════════════════════════════════════════════════════
 //  TIMEZONE HELPERS — konversi deterministik, ngerti DST otomatis
-//  (Ini yang bikin jam gak perlu ditebak-tebak AI lagi)
 // ══════════════════════════════════════════════════════════
 function nthWeekdayOfMonth(year, month, weekday, nth) {
-  // month: 1-indexed, weekday: 0=Sunday
   const d = new Date(Date.UTC(year, month - 1, 1));
   let count = 0;
   while (true) {
@@ -160,13 +156,12 @@ function nthWeekdayOfMonth(year, month, weekday, nth) {
 }
 
 function lastWeekdayOfMonth(year, month, weekday) {
-  const d = new Date(Date.UTC(year, month, 0)); // hari terakhir bulan itu
+  const d = new Date(Date.UTC(year, month, 0));
   while (d.getUTCDay() !== weekday) d.setUTCDate(d.getUTCDate() - 1);
   return d;
 }
 
 function isUSDST(dateUTC) {
-  // AS: DST mulai Minggu ke-2 Maret, berakhir Minggu ke-1 November
   const year = dateUTC.getUTCFullYear();
   const start = nthWeekdayOfMonth(year, 3, 0, 2);
   const end = nthWeekdayOfMonth(year, 11, 0, 1);
@@ -174,31 +169,30 @@ function isUSDST(dateUTC) {
 }
 
 function isEUDST(dateUTC) {
-  // Eropa: DST mulai Minggu terakhir Maret, berakhir Minggu terakhir Oktober
   const year = dateUTC.getUTCFullYear();
   const start = lastWeekdayOfMonth(year, 3, 0);
   const end = lastWeekdayOfMonth(year, 10, 0);
   return dateUTC >= start && dateUTC < end;
 }
 
-// dateStr format "YYYY-MM-DD" (tanggal LOKAL di zona itu), hour/minute jam lokal
 function etToWIB(dateStr, hour, minute) {
   const refUTC = new Date(`${dateStr}T12:00:00Z`);
-  const offsetET = isUSDST(refUTC) ? -4 : -5; // EDT / EST
+  const offsetET = isUSDST(refUTC) ? -4 : -5;
   const eventUTC = new Date(`${dateStr}T00:00:00Z`);
   eventUTC.setUTCHours(hour - offsetET, minute, 0, 0);
-  return new Date(eventUTC.getTime() + 7 * 3600 * 1000); // WIB = UTC+7
+  return new Date(eventUTC.getTime() + 7 * 3600 * 1000);
 }
 
 function cetToWIB(dateStr, hour, minute) {
   const refUTC = new Date(`${dateStr}T12:00:00Z`);
-  const offsetCET = isEUDST(refUTC) ? 2 : 1; // CEST / CET
+  const offsetCET = isEUDST(refUTC) ? 2 : 1;
   const eventUTC = new Date(`${dateStr}T00:00:00Z`);
   eventUTC.setUTCHours(hour - offsetCET, minute, 0, 0);
   return new Date(eventUTC.getTime() + 7 * 3600 * 1000);
 }
 
 const MONTH_NAMES = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+const MONTH_MAP = { Januari: 0, Februari: 1, Maret: 2, April: 3, Mei: 4, Juni: 5, Juli: 6, Agustus: 7, September: 8, Oktober: 9, November: 10, Desember: 11 };
 
 function fmtWIBDate(wibDate) {
   return `${wibDate.getUTCDate()} ${MONTH_NAMES[wibDate.getUTCMonth()]}`;
@@ -210,73 +204,7 @@ function fmtWIBTime(wibDate) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  JADWAL MACRO YANG SUDAH PASTI (hardcode dari kalender resmi)
-//  Sumber: federalreserve.gov/monetarypolicy/fomccalendars.htm
-//          ecb.europa.eu (Governing Council monetary policy meetings)
-//  Update manual kalau ada jadwal baru diumumin / tahun berganti.
-// ══════════════════════════════════════════════════════════
-const FOMC_MEETINGS = [
-  { start: "2026-01-27", end: "2026-01-28" },
-  { start: "2026-03-17", end: "2026-03-18" },
-  { start: "2026-04-28", end: "2026-04-29" },
-  { start: "2026-06-16", end: "2026-06-17" },
-  { start: "2026-07-28", end: "2026-07-29" },
-  { start: "2026-09-15", end: "2026-09-16" },
-  { start: "2026-10-27", end: "2026-10-28" },
-  { start: "2026-12-08", end: "2026-12-09" },
-  { start: "2027-01-26", end: "2027-01-27" },
-  { start: "2027-03-16", end: "2027-03-17" },
-  { start: "2027-04-27", end: "2027-04-28" },
-  { start: "2027-06-08", end: "2027-06-09" },
-  { start: "2027-07-27", end: "2027-07-28" },
-  { start: "2027-09-14", end: "2027-09-15" },
-  { start: "2027-10-26", end: "2027-10-27" },
-  { start: "2027-12-07", end: "2027-12-08" },
-];
-
-// Catatan: daftar ECB 2026 di bawah belum lengkap 8 meeting (baru ketemu 7
-// dari sumber yang saya cek), kemungkinan ada 1 meeting awal tahun yang belum
-// ke-capture. Kalau nemu jadwal lengkapnya, tambahin di sini.
-const ECB_MEETINGS = [
-  "2026-03-19", "2026-04-30", "2026-06-11", "2026-07-23",
-  "2026-09-10", "2026-10-29", "2026-12-17",
-];
-
-function getHardcodedMacroEvents(daysAhead = 45) {
-  const now = new Date();
-  const cutoff = new Date(now.getTime() + daysAhead * 86400000);
-  const events = [];
-
-  for (const m of FOMC_MEETINGS) {
-    const wib = etToWIB(m.end, 14, 0); // statement dirilis 2:00 PM ET hari terakhir meeting
-    if (wib >= now && wib <= cutoff) {
-      events.push({ date: fmtWIBDate(wib), time_wib: fmtWIBTime(wib), event: "FOMC Meeting (Keputusan Suku Bunga The Fed)", category: "macro", _sort: wib.getTime() });
-    }
-  }
-
-  for (const d of ECB_MEETINGS) {
-    const wib = cetToWIB(d, 13, 45);
-    if (wib >= now && wib <= cutoff) {
-      events.push({ date: fmtWIBDate(wib), time_wib: fmtWIBTime(wib), event: "ECB Rate Decision (Keputusan Suku Bunga Bank Eropa)", category: "macro", _sort: wib.getTime() });
-    }
-  }
-
-  // NFP: selalu Jumat pertama tiap bulan, 8:30 AM ET
-  for (let i = 0; i < 3; i++) {
-    const target = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + i, 1));
-    const firstFriday = nthWeekdayOfMonth(target.getUTCFullYear(), target.getUTCMonth() + 1, 5, 1);
-    const dateStr = firstFriday.toISOString().slice(0, 10);
-    const wib = etToWIB(dateStr, 8, 30);
-    if (wib >= now && wib <= cutoff) {
-      events.push({ date: fmtWIBDate(wib), time_wib: fmtWIBTime(wib), event: "Nonfarm Payrolls (NFP) AS", category: "macro", _sort: wib.getTime() });
-    }
-  }
-
-  return events;
-}
-
-// ══════════════════════════════════════════════════════════
-//  SERPER.DEV — WEB & NEWS SEARCH (buat yang GAK bisa dihardcode)
+//  SERPER.DEV — SEARCH, NEWS & SCRAPE
 // ══════════════════════════════════════════════════════════
 async function serperSearch(env, query, endpoint = "search", num = 10) {
   if (!env.SERPER_API_KEY) throw new Error("SERPER_API_KEY belum di-set di Cloudflare Secrets.");
@@ -294,6 +222,24 @@ async function serperSearch(env, query, endpoint = "search", num = 10) {
   }
   if (!res.ok) throw new Error(`Serper HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`);
   return data;
+}
+
+async function serperScrape(env, url) {
+  if (!env.SERPER_API_KEY) throw new Error("SERPER_API_KEY belum di-set.");
+  const res = await fetch("https://scrape.serper.dev", {
+    method: "POST",
+    headers: { "X-API-KEY": env.SERPER_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  const raw = await res.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`Scrape response bukan JSON (HTTP ${res.status})`);
+  }
+  if (!res.ok) throw new Error(`Scrape HTTP ${res.status}: ${JSON.stringify(data).slice(0, 200)}`);
+  return data.text || data.markdown || "";
 }
 
 function extractItems(result, type) {
@@ -355,7 +301,6 @@ async function callGroqIndexed(env, idx, messages, maxTokens = 1200, temperature
   throw new Error(`Semua key Groq gagal (panggilan #${idx + 1}): ${lastErr}`);
 }
 
-// Helper: format pesan error jadi ramah kalau rate limit, biasa kalau bukan
 function friendlyErrorMessage(e, context) {
   if (e.isRateLimit) {
     return `🚫 *Limit Groq API tercapai*\n\nSemua API key Groq lagi kena rate limit. Biasanya reset per jam atau per hari tergantung tier akun Groq kamu.\n\n💡 Coba lagi beberapa jam lagi atau besok ya.`;
@@ -364,38 +309,51 @@ function friendlyErrorMessage(e, context) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  JADWAL NEWS — gabungan hardcode (FOMC/ECB/NFP) + search (CPI/PPI/kripto)
+//  MACRO EVENTS — scrape LANGSUNG dari halaman kalender resmi
+//  (bukan hardcode, bukan search snippet - baca isi asli halamannya)
 // ══════════════════════════════════════════════════════════
-const DATE_ONLY_SYSTEM_PROMPT = `Kamu asisten yang mengekstrak TANGGAL RILIS event ekonomi dari hasil pencarian web mentah.
+const MACRO_SOURCES = [
+  { name: "FOMC Meeting Calendar (federalreserve.gov, resmi)", url: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm" },
+  { name: "ECB Governing Council Meetings (ecb.europa.eu, resmi)", url: "https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html" },
+];
+
+function blsScheduleUrl(year) {
+  return `https://www.bls.gov/schedule/news_release/${year}_sched.htm`;
+}
+
+const MACRO_SCRAPE_PROMPT = `Kamu asisten yang mengekstrak jadwal event ekonomi dari ISI ASLI halaman kalender resmi (bukan hasil search, ini konten asli halaman).
 ATURAN KETAT:
 - Balas HANYA dengan JSON array valid. TIDAK ADA teks lain, TIDAK ADA markdown code fence.
-- Format tiap item persis: {"date_iso":"YYYY-MM-DD","event":"Nama event singkat (CPI AS / PPI AS)"}
-- JANGAN sertakan jam - itu akan dihitung terpisah oleh kode.
-- KALAU data mentah tidak menyebutkan tanggal yang jelas, JANGAN masukkan event itu. Jangan mengarang tanggal.
-- Kalau data mentah sama sekali tidak cukup, balas array kosong: []`;
+- Format tiap item persis: {"date_iso":"YYYY-MM-DD","event":"Nama event (FOMC Meeting / ECB Rate Decision / CPI / PPI / Nonfarm Payrolls)","time_local":"HH:MM" atau null,"tz":"ET" atau "CET" atau null}
+- Ambil SEMUA tanggal event yang kamu temukan di konten, termasuk yang jauh di masa depan - kode yang akan filter mana yang relevan.
+- "time_local" isi HANYA kalau memang tertulis jelas di halaman. Kalau gak ada, isi null - JANGAN mengarang.
+- Untuk FOMC: event = "FOMC Meeting", ambil tanggal HARI TERAKHIR tiap meeting (biasanya meeting 2 hari, ambil hari ke-2).
+- Untuk ECB: event = "ECB Rate Decision".
+- Untuk BLS: pisahkan jadi 3 kategori event berbeda: "CPI" (Consumer Price Index), "PPI" (Producer Price Index), "Nonfarm Payrolls" (Employment Situation).
+- Kalau suatu sumber gagal/kosong, skip aja, jangan mengarang datanya.
+- Balas array kosong [] kalau semua sumber gagal/gak ada data valid.`;
 
-const CRYPTO_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar event kripto (regulasi, ETF, listing besar, upgrade jaringan) dari hasil pencarian web mentah.
-ATURAN KETAT:
-- Balas HANYA dengan JSON array valid. TIDAK ADA teks lain, TIDAK ADA markdown code fence.
-- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat"}
-- "time_wib" WAJIB format 24 jam, dikonversi ke WIB (UTC+7) kalau sumber nyebut jam dengan jelas. Kalau gak jelas, isi "-".
-- KALAU data mentah tidak menyebutkan tanggal yang jelas, JANGAN masukkan event itu. Jangan mengarang tanggal.
-- Ambil maksimal 6 event yang paling relevan/penting.
-- Kalau data mentah sama sekali tidak cukup, balas array kosong: []`;
-
-async function getCpiPpiEvents(env) {
+async function getMacroEventsFromScrape(env) {
   const now = new Date();
-  const monthYear = `${MONTH_NAMES[now.getUTCMonth()]} ${now.getUTCFullYear()}`;
-  const result = await serperSearch(env, `CPI PPI inflation release date ${monthYear} BLS`, "search", 6).catch(() => null);
-  if (!result) return [];
+  const sources = [...MACRO_SOURCES, { name: "BLS Economic Release Schedule (bls.gov, resmi - CPI/PPI/NFP)", url: blsScheduleUrl(now.getUTCFullYear()) }];
 
-  const items = extractItems(result, "search");
-  if (!items.length) return [];
+  const scraped = await Promise.all(
+    sources.map((s) =>
+      serperScrape(env, s.url)
+        .then((text) => ({ ...s, text }))
+        .catch((e) => ({ ...s, text: null, error: e.message }))
+    )
+  );
 
-  const rawItems = items.map((o) => `- ${o.title}: ${o.snippet} (${o.date || "tanggal tidak disebutkan"}) [sumber: ${o.source}]`).join("\n");
-  const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)}.\n\nHasil pencarian:\n${rawItems}`;
+  const rawSections = scraped
+    .filter((s) => s.text)
+    .map((s) => `=== SUMBER RESMI: ${s.name} ===\n${s.text.slice(0, 4500)}`)
+    .join("\n\n");
 
-  const raw = await callGroqIndexed(env, 0, [{ role: "system", content: DATE_ONLY_SYSTEM_PROMPT }, { role: "user", content: userMsg }], 500, 0.1);
+  if (!rawSections) return [];
+
+  const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)} (YYYY-MM-DD).\n\n${rawSections}`;
+  const raw = await callGroqIndexed(env, 0, [{ role: "system", content: MACRO_SCRAPE_PROMPT }, { role: "user", content: userMsg }], 3000, 0.1);
 
   let list;
   try {
@@ -405,14 +363,42 @@ async function getCpiPpiEvents(env) {
     return [];
   }
 
+  const DEFAULT_TIMES = {
+    "FOMC Meeting": { hour: 14, minute: 0, tz: "ET" },
+    "ECB Rate Decision": { hour: 13, minute: 45, tz: "CET" },
+    "CPI": { hour: 8, minute: 30, tz: "ET" },
+    "PPI": { hour: 8, minute: 30, tz: "ET" },
+    "Nonfarm Payrolls": { hour: 8, minute: 30, tz: "ET" },
+  };
+
+  const daysAhead = 60;
+  const cutoff = new Date(now.getTime() + daysAhead * 86400000);
+
   return list
     .map((it) => {
-      if (!it.date_iso) return null;
-      const wib = etToWIB(it.date_iso, 8, 30); // konvensi BLS: selalu 8:30 AM ET
+      if (!it.date_iso || !it.event) return null;
+      const def = DEFAULT_TIMES[it.event] || { hour: 12, minute: 0, tz: "ET" };
+      const hour = it.time_local ? parseInt(it.time_local.split(":")[0], 10) : def.hour;
+      const minute = it.time_local ? parseInt(it.time_local.split(":")[1], 10) : def.minute;
+      const tz = it.tz || def.tz;
+      const wib = tz === "CET" ? cetToWIB(it.date_iso, hour, minute) : etToWIB(it.date_iso, hour, minute);
+      if (wib < now || wib > cutoff) return null;
       return { date: fmtWIBDate(wib), time_wib: fmtWIBTime(wib), event: it.event, category: "macro", _sort: wib.getTime() };
     })
     .filter(Boolean);
 }
+
+// ══════════════════════════════════════════════════════════
+//  CRYPTO EVENTS — tetap dari search+news (gak ada kalender resmi tunggal)
+// ══════════════════════════════════════════════════════════
+const CRYPTO_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar event kripto (regulasi, ETF, listing besar, upgrade jaringan) dari hasil pencarian web mentah.
+ATURAN KETAT:
+- Balas HANYA dengan JSON array valid. TIDAK ADA teks lain, TIDAK ADA markdown code fence.
+- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat"}
+- "time_wib" WAJIB format 24 jam, dikonversi ke WIB (UTC+7) kalau sumber nyebut jam dengan jelas. Kalau gak jelas, isi "-".
+- KALAU data mentah tidak menyebutkan tanggal yang jelas, JANGAN masukkan event itu. Jangan mengarang tanggal.
+- Ambil maksimal 6 event yang paling relevan/penting.
+- Kalau data mentah sama sekali tidak cukup, balas array kosong: []`;
 
 async function getCryptoEvents(env) {
   const now = new Date();
@@ -436,45 +422,57 @@ async function getCryptoEvents(env) {
   const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)}.\n\nHasil pencarian:\n${rawLines.join("\n")}`;
   const raw = await callGroqIndexed(env, 1, [{ role: "system", content: CRYPTO_SYSTEM_PROMPT }, { role: "user", content: userMsg }], 1000, 0.2);
 
+  let list;
   try {
-    const list = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    list = JSON.parse(raw.replace(/```json|```/g, "").trim());
     if (!Array.isArray(list)) return [];
-    return list.map((it) => ({ ...it, category: "crypto", _sort: 0 }));
   } catch (e) {
     return [];
   }
+
+  return list.map((it) => {
+    const parts = (it.date || "").split(" ");
+    let sortTs = now.getTime();
+    if (parts.length === 2 && MONTH_MAP[parts[1]] !== undefined) {
+      const day = parseInt(parts[0], 10);
+      const month = MONTH_MAP[parts[1]];
+      let yr = now.getUTCFullYear();
+      const guess = new Date(Date.UTC(yr, month, day));
+      if (guess < now) yr += 1;
+      sortTs = Date.UTC(yr, month, day);
+    }
+    return { ...it, category: "crypto", _sort: sortTs };
+  });
 }
 
+// ══════════════════════════════════════════════════════════
+//  JADWAL NEWS — gabungan macro (scrape) + crypto (search)
+// ══════════════════════════════════════════════════════════
 async function buildScheduleList(env, forceRefresh = false) {
-  const macroHardcoded = getHardcodedMacroEvents(); // selalu fresh, murah, gak perlu cache
-
   if (!forceRefresh) {
     const cacheRaw = await env.BOT_KV.get(SCHEDULE_CACHE_KEY);
     if (cacheRaw) {
       try {
         const cached = JSON.parse(cacheRaw);
-        if (Array.isArray(cached.searchDerived)) {
-          return mergeAndSort(macroHardcoded, cached.searchDerived);
-        }
+        if (Array.isArray(cached.list) && cached.list.length > 0) return cached.list;
       } catch (e) { /* cache korup, lanjut rebuild */ }
     }
   }
 
-  const [cpiPpi, crypto] = await Promise.all([
-    getCpiPpiEvents(env).catch(() => []),
+  const [macro, crypto] = await Promise.all([
+    getMacroEventsFromScrape(env).catch(() => []),
     getCryptoEvents(env).catch(() => []),
   ]);
-  const searchDerived = [...cpiPpi, ...crypto];
 
-  if (searchDerived.length > 0) {
-    await env.BOT_KV.put(SCHEDULE_CACHE_KEY, JSON.stringify({ searchDerived, ts: Date.now() }), { expirationTtl: SCHEDULE_CACHE_TTL });
+  const list = mergeAndSort(macro, crypto);
+  if (list.length > 0) {
+    await env.BOT_KV.put(SCHEDULE_CACHE_KEY, JSON.stringify({ list, ts: Date.now() }), { expirationTtl: SCHEDULE_CACHE_TTL });
   }
-
-  return mergeAndSort(macroHardcoded, searchDerived);
+  return list;
 }
 
-function mergeAndSort(macroHardcoded, searchDerived) {
-  const all = [...macroHardcoded, ...searchDerived];
+function mergeAndSort(macro, crypto) {
+  const all = [...macro, ...crypto];
   all.sort((a, b) => (a._sort || 0) - (b._sort || 0));
   return all.slice(0, 15);
 }
@@ -487,7 +485,7 @@ function scheduleText(list) {
     const tag = it.category === "crypto" ? "🪙" : "🏛️";
     lines.push(`${i + 1}. ${tag} *${it.date}, ${jam}* — ${it.event}`);
   });
-  lines.push("\n_🏛️ = data pasti (kalender resmi) · 🪙 = hasil pencarian berita, cek ulang di sumber resmi._");
+  lines.push("\n_🏛️ = scrape langsung dari kalender resmi · 🪙 = hasil pencarian berita, cek ulang di sumber resmi._");
   return lines.join("\n");
 }
 
@@ -629,9 +627,9 @@ async function handleMessage(message, env) {
   if (txt === "/help" || txt === "❓ Bantuan") {
     await sendMessage(env, chatId,
       "❓ *BANTUAN*\n\n" +
-      "📅 *Jadwal News* → lihat daftar event ekonomi & kripto terdekat. FOMC/ECB/NFP diambil dari kalender resmi (pasti akurat), CPI/PPI/kripto dari hasil pencarian berita terkini.\n\n" +
+      "📅 *Jadwal News* → lihat daftar event ekonomi & kripto terdekat. FOMC/ECB/CPI/PPI/NFP di-scrape langsung dari halaman kalender resmi (federalreserve.gov, ecb.europa.eu, bls.gov). Event kripto dari hasil pencarian berita terkini.\n\n" +
       "📰 *Analisa News* → sama seperti Jadwal News, tapi tiap event bisa di-tap. Pilih 5 atau 10 AI, bot akan cari berita terkait event itu dan menyimpulkan sentimen/dampaknya ke market.\n\n" +
-      "Data CPI/PPI/kripto di-cache 6 jam. Tap '🔄 Refresh Jadwal' kalau mau paksa update."
+      "Data di-cache 6 jam. Tap '🔄 Refresh Jadwal' kalau mau paksa update."
     );
     return;
   }
