@@ -396,6 +396,11 @@ async function getMacroEventsFromScrape(env) {
     return [];
   }
 
+  // Log APA SAJA yang berhasil diekstrak Groq SEBELUM difilter tanggal —
+  // supaya kelihatan apakah FOMC/dll memang ada di hasil ekstraksi atau
+  // sudah hilang sejak dari Groq (bukan gara-gara logic filter tanggal).
+  console.log(`[MACRO] Groq ekstrak ${list.length} item mentah:`, JSON.stringify(list.map((it) => `${it.event}@${it.date_iso}`)));
+
   const DEFAULT_TIMES = {
     "FOMC Meeting": { hour: 14, minute: 0, tz: "ET" },
     "ECB Rate Decision": { hour: 13, minute: 45, tz: "CET" },
@@ -408,9 +413,12 @@ async function getMacroEventsFromScrape(env) {
   const todayStart = startOfTodayUTC(now);
   const cutoff = new Date(now.getTime() + daysAhead * 86400000);
 
-  return list
+  const result = list
     .map((it) => {
-      if (!it.date_iso || !it.event) return null;
+      if (!it.date_iso || !it.event) {
+        console.log(`[MACRO] Item dibuang (date_iso/event kosong):`, JSON.stringify(it));
+        return null;
+      }
       const def = DEFAULT_TIMES[it.event] || { hour: 12, minute: 0, tz: "ET" };
       const hour = it.time_local ? parseInt(it.time_local.split(":")[0], 10) : def.hour;
       const minute = it.time_local ? parseInt(it.time_local.split(":")[1], 10) : def.minute;
@@ -418,10 +426,16 @@ async function getMacroEventsFromScrape(env) {
       const wib = tz === "CET" ? cetToWIB(it.date_iso, hour, minute) : etToWIB(it.date_iso, hour, minute);
       // Buang kalau sudah lewat (dibanding awal hari ini) atau lebih dari 60 hari ke depan.
       // TIDAK ADA proyeksi "ke tahun depan" di sini — kalau lewat, ya dibuang saja.
-      if (wib < todayStart || wib > cutoff) return null;
+      if (wib < todayStart || wib > cutoff) {
+        console.log(`[MACRO] Item dibuang (di luar rentang tanggal): ${it.event}@${it.date_iso} → WIB ${wib.toISOString()} (today=${todayStart.toISOString()}, cutoff=${cutoff.toISOString()})`);
+        return null;
+      }
       return { date: fmtWIBDate(wib), time_wib: fmtWIBTime(wib), event: it.event, category: "macro", _sort: wib.getTime() };
     })
     .filter(Boolean);
+
+  console.log(`[MACRO] Hasil akhir setelah filter: ${result.length} item`);
+  return result;
 }
 
 // ══════════════════════════════════════════════════════════
