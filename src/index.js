@@ -1,28 +1,33 @@
 /**
  * 📰 News & Economic Calendar Analyst Bot — Cloudflare Workers edition
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * v2.3 — Perubahan dari v2.2:
- * 1. FOMC/ECB/CPI/PPI/NFP sekarang di-SCRAPE langsung dari halaman kalender
- *    resmi (federalreserve.gov, ecb.europa.eu, bls.gov) pakai Serper Scrape
- *    API - bukan hardcode tabel manual (rawan basi) atau search snippet
- *    (rawan kepotong). Groq baca ISI ASLI halaman, tugasnya cuma ekstraksi,
- *    bukan ngarang. Update sendiri tiap kali dipanggil, gak perlu maintenance.
- * 2. Waktu rilis (jam) TETAP dihitung kode secara deterministik (ngerti DST
- *    otomatis) - AI cuma ambil tanggal + jam-kalau-ada dari halaman, bukan
- *    disuruh hitung konversi timezone sendiri.
- * 3. Event kripto (regulasi/ETF/listing) tetap dari search+news biasa karena
- *    emang gak ada "kalender resmi" tunggal buat itu.
- * 4. Bug fix: event kripto dulu selalu nongol di atas gara-gara _sort gak
- *    pernah diisi tanggal asli - sekarang di-parse jadi timestamp beneran.
- * 5. Kalau semua API key Groq kena rate limit, bot kasih pesan jelas
- *    ("coba lagi besok") bukan error mentah.
+ * v2.4 — Perubahan dari v2.3 (bugfix jadwal nampilin berita LAMA):
+ * 1. BUG UTAMA: event crypto yang tanggalnya sudah lewat dulu "diproyeksikan
+ *    ke tahun depan" (guess < now → yr += 1), jadi berita LAMA (mis. "harga
+ *    BTC turun 25 Juni") ikut lolos filter dan nongol sebagai "akan datang".
+ *    FIX: tanggal yang sudah lewat sekarang LANGSUNG DIBUANG, tidak pernah
+ *    diproyeksikan ke tahun depan. Event sekali-kejadian (crypto) tidak
+ *    butuh logic "tahunan berulang" seperti itu.
+ * 2. Prompt crypto diperketat: AI hanya boleh masukkan tanggal yang memang
+ *    berupa JADWAL/DEADLINE MENDATANG (keputusan SEC, listing, upgrade),
+ *    BUKAN rekap harga/kejadian yang sudah terjadi — walau tanggalnya
+ *    disebut jelas di cuplikan berita.
+ * 3. Query pencarian crypto diganti dari "news {bulan}" (nyari rekap berita)
+ *    jadi diarahkan ke jadwal/deadline mendatang.
+ * 4. Kegagalan scrape kalender resmi (macro) sekarang di-log via
+ *    console.error dengan detail per-sumber, supaya kelihatan di
+ *    `wrangler tail` kenapa macro sering kosong — sebelumnya ditelan diam²
+ *    lewat catch(() => []).
+ * 5. Safety net tambahan: item macro & crypto yang tanggalnya sudah lewat
+ *    dibuang lagi sekali di tahap gabung (mergeAndSort), jaga-jaga kalau
+ *    ada yang lolos dari filter individual.
  *
  * State per-user disimpan di Cloudflare KV (BOT_KV). Jadwal (macro + kripto)
  * di-cache global 6 jam supaya hemat kuota scrape/search.
  */
 
 const MODEL = "llama-3.3-70b-versatile";
-const SCHEDULE_CACHE_KEY = "news_schedule_cache_v3";
+const SCHEDULE_CACHE_KEY = "news_schedule_cache_v4";
 const SCHEDULE_CACHE_TTL = 6 * 60 * 60; // 6 jam
 
 // ══════════════════════════════════════════════════════════
@@ -203,6 +208,12 @@ function fmtWIBTime(wibDate) {
   return `${h}:${m}`;
 }
 
+// Awal hari ini (UTC) — dipakai sebagai batas bawah "sudah lewat vs akan datang".
+// Pakai awal HARI, bukan jam-menit sekarang, supaya event "hari ini" tetap muncul.
+function startOfTodayUTC(now) {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
 // ══════════════════════════════════════════════════════════
 //  SERPER.DEV — SEARCH, NEWS & SCRAPE
 // ══════════════════════════════════════════════════════════
@@ -345,12 +356,21 @@ async function getMacroEventsFromScrape(env) {
     )
   );
 
+  // Log tiap kegagalan scrape per-sumber, supaya kelihatan jelas di `wrangler tail`
+  // kenapa macro kosong (URL berubah, diblokir, dsb) — sebelumnya ditelan diam-diam.
+  scraped.forEach((s) => {
+    if (!s.text) console.error(`[MACRO SCRAPE FAIL] ${s.name} (${s.url}): ${s.error || "kosong tanpa error message"}`);
+  });
+
   const rawSections = scraped
     .filter((s) => s.text)
     .map((s) => `=== SUMBER RESMI: ${s.name} ===\n${s.text.slice(0, 4500)}`)
     .join("\n\n");
 
-  if (!rawSections) return [];
+  if (!rawSections) {
+    console.error("[MACRO] Semua sumber gagal di-scrape, tidak ada data macro yang bisa diekstrak.");
+    return [];
+  }
 
   const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)} (YYYY-MM-DD).\n\n${rawSections}`;
   const raw = await callGroqIndexed(env, 0, [{ role: "system", content: MACRO_SCRAPE_PROMPT }, { role: "user", content: userMsg }], 3000, 0.1);
@@ -358,8 +378,12 @@ async function getMacroEventsFromScrape(env) {
   let list;
   try {
     list = JSON.parse(raw.replace(/```json|```/g, "").trim());
-    if (!Array.isArray(list)) return [];
+    if (!Array.isArray(list)) {
+      console.error("[MACRO] Groq balas bukan array:", raw.slice(0, 300));
+      return [];
+    }
   } catch (e) {
+    console.error("[MACRO] Gagal parse JSON dari Groq:", e.message, "| raw:", raw.slice(0, 300));
     return [];
   }
 
@@ -372,6 +396,7 @@ async function getMacroEventsFromScrape(env) {
   };
 
   const daysAhead = 60;
+  const todayStart = startOfTodayUTC(now);
   const cutoff = new Date(now.getTime() + daysAhead * 86400000);
 
   return list
@@ -382,7 +407,9 @@ async function getMacroEventsFromScrape(env) {
       const minute = it.time_local ? parseInt(it.time_local.split(":")[1], 10) : def.minute;
       const tz = it.tz || def.tz;
       const wib = tz === "CET" ? cetToWIB(it.date_iso, hour, minute) : etToWIB(it.date_iso, hour, minute);
-      if (wib < now || wib > cutoff) return null;
+      // Buang kalau sudah lewat (dibanding awal hari ini) atau lebih dari 60 hari ke depan.
+      // TIDAK ADA proyeksi "ke tahun depan" di sini — kalau lewat, ya dibuang saja.
+      if (wib < todayStart || wib > cutoff) return null;
       return { date: fmtWIBDate(wib), time_wib: fmtWIBTime(wib), event: it.event, category: "macro", _sort: wib.getTime() };
     })
     .filter(Boolean);
@@ -391,22 +418,30 @@ async function getMacroEventsFromScrape(env) {
 // ══════════════════════════════════════════════════════════
 //  CRYPTO EVENTS — tetap dari search+news (gak ada kalender resmi tunggal)
 // ══════════════════════════════════════════════════════════
-const CRYPTO_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar event kripto (regulasi, ETF, listing besar, upgrade jaringan) dari hasil pencarian web mentah.
-ATURAN KETAT:
+const CRYPTO_SYSTEM_PROMPT = `Kamu asisten yang menyusun daftar JADWAL/DEADLINE kripto MENDATANG (regulasi, keputusan ETF, listing besar, upgrade jaringan) dari hasil pencarian web mentah.
+
+SANGAT PENTING — bedakan ini:
+- BOLEH dimasukkan: tanggal keputusan SEC yang DIJADWALKAN, deadline pengajuan/persetujuan ETF, tanggal listing/upgrade yang DIUMUMKAN akan terjadi.
+- JANGAN dimasukkan: rekap harga yang SUDAH terjadi (misal "harga Bitcoin turun ke $X pada tanggal Y", "Bitcoin naik ke $X"), berita yang menceritakan kejadian di masa lalu, atau analisis pasar yang bukan soal jadwal/deadline resmi.
+- Kalau ragu apakah suatu tanggal itu jadwal mendatang atau cuma rekap kejadian lama → JANGAN dimasukkan, lebih baik dilewati daripada salah.
+
+ATURAN FORMAT KETAT:
 - Balas HANYA dengan JSON array valid. TIDAK ADA teks lain, TIDAK ADA markdown code fence.
-- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat"}
+- Format tiap item persis: {"date":"DD Bulan","time_wib":"HH:MM" atau "-","event":"Nama event singkat (jelas ini jadwal/deadline apa)"}
 - "time_wib" WAJIB format 24 jam, dikonversi ke WIB (UTC+7) kalau sumber nyebut jam dengan jelas. Kalau gak jelas, isi "-".
-- KALAU data mentah tidak menyebutkan tanggal yang jelas, JANGAN masukkan event itu. Jangan mengarang tanggal.
+- KALAU data mentah tidak menyebutkan tanggal MENDATANG yang jelas, JANGAN masukkan event itu. Jangan mengarang tanggal.
 - Ambil maksimal 6 event yang paling relevan/penting.
-- Kalau data mentah sama sekali tidak cukup, balas array kosong: []`;
+- Kalau data mentah sama sekali tidak cukup / semuanya cuma rekap masa lalu, balas array kosong: []`;
 
 async function getCryptoEvents(env) {
   const now = new Date();
   const monthYear = `${MONTH_NAMES[now.getUTCMonth()]} ${now.getUTCFullYear()}`;
 
+  // Query diarahkan ke JADWAL/DEADLINE MENDATANG, bukan "news" bulan ini
+  // (yang isinya kebanyakan rekap harga/kejadian yang sudah lewat).
   const results = await Promise.all([
-    serperSearch(env, `crypto regulation ETF news ${monthYear}`, "news", 6).catch(() => null),
-    serperSearch(env, `jadwal event kripto ${monthYear} SEC bitcoin ethereum`, "news", 6).catch(() => null),
+    serperSearch(env, `crypto ETF SEC decision deadline schedule upcoming`, "news", 8).catch((e) => { console.error("[CRYPTO SEARCH FAIL] query 1:", e.message); return null; }),
+    serperSearch(env, `jadwal keputusan regulasi kripto mendatang ${monthYear}`, "news", 8).catch((e) => { console.error("[CRYPTO SEARCH FAIL] query 2:", e.message); return null; }),
   ]);
 
   const rawLines = [];
@@ -417,7 +452,10 @@ async function getCryptoEvents(env) {
     });
   });
 
-  if (!rawLines.length) return [];
+  if (!rawLines.length) {
+    console.error("[CRYPTO] Tidak ada hasil pencarian sama sekali untuk jadwal crypto.");
+    return [];
+  }
 
   const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)}.\n\nHasil pencarian:\n${rawLines.join("\n")}`;
   const raw = await callGroqIndexed(env, 1, [{ role: "system", content: CRYPTO_SYSTEM_PROMPT }, { role: "user", content: userMsg }], 1000, 0.2);
@@ -425,24 +463,33 @@ async function getCryptoEvents(env) {
   let list;
   try {
     list = JSON.parse(raw.replace(/```json|```/g, "").trim());
-    if (!Array.isArray(list)) return [];
+    if (!Array.isArray(list)) {
+      console.error("[CRYPTO] Groq balas bukan array:", raw.slice(0, 300));
+      return [];
+    }
   } catch (e) {
+    console.error("[CRYPTO] Gagal parse JSON dari Groq:", e.message, "| raw:", raw.slice(0, 300));
     return [];
   }
 
-  return list.map((it) => {
-    const parts = (it.date || "").split(" ");
-    let sortTs = now.getTime();
-    if (parts.length === 2 && MONTH_MAP[parts[1]] !== undefined) {
+  const todayStart = startOfTodayUTC(now);
+  const daysAhead = 60;
+  const cutoff = new Date(now.getTime() + daysAhead * 86400000);
+
+  return list
+    .map((it) => {
+      const parts = (it.date || "").split(" ");
+      if (parts.length !== 2 || MONTH_MAP[parts[1]] === undefined) return null; // tanggal gak jelas → buang
       const day = parseInt(parts[0], 10);
       const month = MONTH_MAP[parts[1]];
-      let yr = now.getUTCFullYear();
+      const yr = now.getUTCFullYear();
       const guess = new Date(Date.UTC(yr, month, day));
-      if (guess < now) yr += 1;
-      sortTs = Date.UTC(yr, month, day);
-    }
-    return { ...it, category: "crypto", _sort: sortTs };
-  });
+      // FIX UTAMA: kalau sudah lewat → BUANG. Tidak pernah diproyeksikan ke tahun depan.
+      // Event crypto sifatnya sekali-kejadian, bukan tahunan berulang seperti FOMC/ECB.
+      if (guess < todayStart || guess > cutoff) return null;
+      return { ...it, category: "crypto", _sort: guess.getTime() };
+    })
+    .filter(Boolean);
 }
 
 // ══════════════════════════════════════════════════════════
@@ -460,8 +507,8 @@ async function buildScheduleList(env, forceRefresh = false) {
   }
 
   const [macro, crypto] = await Promise.all([
-    getMacroEventsFromScrape(env).catch(() => []),
-    getCryptoEvents(env).catch(() => []),
+    getMacroEventsFromScrape(env).catch((e) => { console.error("[MACRO] Error tak tertangani:", e.message); return []; }),
+    getCryptoEvents(env).catch((e) => { console.error("[CRYPTO] Error tak tertangani:", e.message); return []; }),
   ]);
 
   const list = mergeAndSort(macro, crypto);
@@ -472,13 +519,16 @@ async function buildScheduleList(env, forceRefresh = false) {
 }
 
 function mergeAndSort(macro, crypto) {
-  const all = [...macro, ...crypto];
+  const now = Date.now();
+  // Safety net: buang lagi item yang somehow punya _sort di masa lalu,
+  // jaga-jaga ada yang lolos dari filter individual di atas.
+  const all = [...macro, ...crypto].filter((it) => typeof it._sort === "number" && it._sort >= now - 24 * 3600 * 1000);
   all.sort((a, b) => (a._sort || 0) - (b._sort || 0));
   return all.slice(0, 15);
 }
 
 function scheduleText(list) {
-  if (!list.length) return "📭 Belum ada jadwal event yang berhasil ditemukan. Coba lagi beberapa saat lagi.";
+  if (!list.length) return "📭 Belum ada jadwal event mendatang yang berhasil ditemukan. Coba lagi beberapa saat lagi atau tap '🔄 Refresh Jadwal'.";
   const lines = ["📅 *JADWAL NEWS TERDEKAT* (waktu WIB)\n"];
   list.forEach((it, i) => {
     const jam = it.time_wib && it.time_wib !== "-" ? `${it.time_wib} WIB` : "jam belum diketahui";
@@ -627,7 +677,7 @@ async function handleMessage(message, env) {
   if (txt === "/help" || txt === "❓ Bantuan") {
     await sendMessage(env, chatId,
       "❓ *BANTUAN*\n\n" +
-      "📅 *Jadwal News* → lihat daftar event ekonomi & kripto terdekat. FOMC/ECB/CPI/PPI/NFP di-scrape langsung dari halaman kalender resmi (federalreserve.gov, ecb.europa.eu, bls.gov). Event kripto dari hasil pencarian berita terkini.\n\n" +
+      "📅 *Jadwal News* → lihat daftar event ekonomi & kripto terdekat (yang AKAN datang, bukan yang sudah lewat). FOMC/ECB/CPI/PPI/NFP di-scrape langsung dari halaman kalender resmi (federalreserve.gov, ecb.europa.eu, bls.gov). Event kripto dari hasil pencarian jadwal/deadline terkini.\n\n" +
       "📰 *Analisa News* → sama seperti Jadwal News, tapi tiap event bisa di-tap. Pilih 5 atau 10 AI, bot akan cari berita terkait event itu dan menyimpulkan sentimen/dampaknya ke market.\n\n" +
       "Data di-cache 6 jam. Tap '🔄 Refresh Jadwal' kalau mau paksa update."
     );
@@ -654,7 +704,7 @@ async function handleMessage(message, env) {
       s.schedule = list;
       await saveSession(env, uid, s);
       if (!list.length) {
-        await sendMessage(env, chatId, "📭 Belum ada jadwal event yang bisa dianalisa saat ini. Coba lagi nanti.");
+        await sendMessage(env, chatId, "📭 Belum ada jadwal event mendatang yang bisa dianalisa saat ini. Coba lagi nanti.");
         return;
       }
       await sendMessage(env, chatId, "📰 *ANALISA NEWS*\n\nTap salah satu event buat dianalisa:", { reply_markup: scheduleKb(list) });
