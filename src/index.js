@@ -557,6 +557,13 @@ function scheduleKb(list) {
   return { inline_keyboard: rows };
 }
 
+// Keyboard khusus untuk tampilan "📅 Jadwal News" (bukan pemilihan event untuk dianalisa).
+// Sebelumnya tampilan ini dikirim TANPA tombol apapun, jadi user terjebak cache 6 jam
+// tanpa cara paksa refresh dari sini.
+function jadwalViewKb() {
+  return { inline_keyboard: [[{ text: "🔄 Refresh Jadwal", callback_data: "refresh_jadwal_view" }]] };
+}
+
 // ══════════════════════════════════════════════════════════
 //  ANALISA NEWS — voting N AI + 1 kesimpulan
 // ══════════════════════════════════════════════════════════
@@ -703,7 +710,7 @@ async function handleMessage(message, env) {
       const list = await buildScheduleList(env);
       s.schedule = list;
       await saveSession(env, uid, s);
-      await sendMessage(env, chatId, scheduleText(list));
+      await sendMessage(env, chatId, scheduleText(list), { reply_markup: jadwalViewKb() });
     } catch (e) {
       await sendMessage(env, chatId, friendlyErrorMessage(e, "ambil jadwal"));
     }
@@ -738,6 +745,19 @@ async function handleCallback(cb, env) {
 
   if (!isAllowed(uid, env)) { await answerCallback(env, cb.id, "🔒 Akses ditolak."); return; }
   await answerCallback(env, cb.id, "");
+
+  if (data === "refresh_jadwal_view") {
+    await editMessageText(env, chatId, cb.message.message_id, "⏳ Refreshing jadwal...");
+    try {
+      const list = await buildScheduleList(env, true);
+      s.schedule = list;
+      await saveSession(env, uid, s);
+      await editMessageText(env, chatId, cb.message.message_id, scheduleText(list), { reply_markup: jadwalViewKb() });
+    } catch (e) {
+      await editMessageText(env, chatId, cb.message.message_id, friendlyErrorMessage(e, "refresh"));
+    }
+    return;
+  }
 
   if (data === "refresh_schedule") {
     await editMessageText(env, chatId, cb.message.message_id, "⏳ Refreshing jadwal...");
