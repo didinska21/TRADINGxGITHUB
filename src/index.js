@@ -358,13 +358,22 @@ async function getMacroEventsFromScrape(env) {
 
   // Log tiap kegagalan scrape per-sumber, supaya kelihatan jelas di `wrangler tail`
   // kenapa macro kosong (URL berubah, diblokir, dsb) — sebelumnya ditelan diam-diam.
+  // Juga log PANJANG konten yang berhasil di-scrape — kalau angkanya kecil/pas-pasan
+  // di limit character, itu tanda kontennya kemungkinan terpotong sebelum sampai ke
+  // tabel tanggal asli (banyak halaman resmi punya nav/breadcrumb panjang di atas).
   scraped.forEach((s) => {
     if (!s.text) console.error(`[MACRO SCRAPE FAIL] ${s.name} (${s.url}): ${s.error || "kosong tanpa error message"}`);
+    else console.log(`[MACRO SCRAPE OK] ${s.name}: ${s.text.length} karakter`);
   });
 
+  // FIX: sebelumnya cuma ambil 4500 karakter pertama per sumber — banyak halaman
+  // kalender resmi punya nav/header/breadcrumb panjang duluan sebelum tabel tanggal
+  // aslinya, jadi tabelnya kepotong dan gak ke-extract (ini penyebab FOMC/BLS sering
+  // kosong). Model Groq yang dipakai context window-nya besar, aman dinaikkan jauh.
+  const PER_SOURCE_CHAR_LIMIT = 15000;
   const rawSections = scraped
     .filter((s) => s.text)
-    .map((s) => `=== SUMBER RESMI: ${s.name} ===\n${s.text.slice(0, 4500)}`)
+    .map((s) => `=== SUMBER RESMI: ${s.name} ===\n${s.text.slice(0, PER_SOURCE_CHAR_LIMIT)}`)
     .join("\n\n");
 
   if (!rawSections) {
@@ -373,7 +382,7 @@ async function getMacroEventsFromScrape(env) {
   }
 
   const userMsg = `Hari ini: ${now.toISOString().slice(0, 10)} (YYYY-MM-DD).\n\n${rawSections}`;
-  const raw = await callGroqIndexed(env, 0, [{ role: "system", content: MACRO_SCRAPE_PROMPT }, { role: "user", content: userMsg }], 3000, 0.1);
+  const raw = await callGroqIndexed(env, 0, [{ role: "system", content: MACRO_SCRAPE_PROMPT }, { role: "user", content: userMsg }], 4000, 0.1);
 
   let list;
   try {
@@ -560,8 +569,12 @@ FORMAT OUTPUT WAJIB (Bahasa Indonesia, singkat padat):
 📊 Sentimen      : Bullish 🟢 / Bearish 🔴 / Netral ⚪
 💥 Dampak Market : [1-2 kalimat]`;
 
-function newsConsensusPrompt(n) {
-  return `Kamu adalah Chief News Analyst yang mengawasi ${n} analis berita independen yang sudah menganalisa event yang sama.
+// nTotal = total panggilan AI (sesuai angka di tombol yang user tap, mis. 5 atau 10).
+// nOpinions = nTotal - 1 (jumlah analis independen sebelum panggilan penyimpul).
+// Header WAJIB pakai nTotal supaya konsisten dengan tombol yang user tap —
+// sebelumnya header salah pakai nOpinions, jadi tap "5 AI" malah muncul "(4 AI)".
+function newsConsensusPrompt(nTotal, nOpinions) {
+  return `Kamu adalah Chief News Analyst yang mengawasi ${nOpinions} analis berita independen yang sudah menganalisa event yang sama.
 Tugasmu MENYIMPULKAN, bukan membuat analisa baru:
 1. Tentukan sentimen tiap analisis: Bullish, Bearish, atau Netral. Abaikan yang error.
 2. Hitung suara tiap sentimen. Suara terbanyak = kesimpulan final. Kalau seri → Netral.
@@ -569,7 +582,7 @@ Tugasmu MENYIMPULKAN, bukan membuat analisa baru:
 
 FORMAT OUTPUT WAJIB:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🧠 KESIMPULAN ANALISA NEWS (${n} AI)
+🧠 KESIMPULAN ANALISA NEWS (${nTotal} AI)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📰 Event      : [nama event]
 📊 Voting     : Bullish [n] | Bearish [n] | Netral [n]
@@ -577,8 +590,8 @@ FORMAT OUTPUT WAJIB:
 💥 Dampak     : [ringkas]
 📝 Kesimpulan :
 [Maksimal 5 kalimat Bahasa Indonesia.]
-⚠️ Catatan    : Ini konsensus dari ${n} panggilan model AI yang SAMA dengan variasi random sampling,
-bukan ${n} model berbeda — anggap sebagai pengecekan konsistensi, bukan validasi independen penuh.
+⚠️ Catatan    : Ini konsensus dari ${nOpinions} analis independen + 1 panggilan penyimpul (total ${nTotal} panggilan model AI YANG SAMA)
+dengan variasi random sampling, bukan ${nTotal} model berbeda — anggap sebagai pengecekan konsistensi, bukan validasi independen penuh.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
 }
 
@@ -632,7 +645,7 @@ async function analyzeEvent(env, event, nTotal) {
 
   const final = await callGroqIndexed(
     env, nOpinions,
-    [{ role: "system", content: newsConsensusPrompt(nOpinions) }, { role: "user", content: consensusInput }],
+    [{ role: "system", content: newsConsensusPrompt(nTotal, nOpinions) }, { role: "user", content: consensusInput }],
     1200, 0.3
   );
   return { final, opinions };
